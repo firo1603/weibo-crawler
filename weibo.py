@@ -188,6 +188,8 @@ class Weibo(object):
         if isinstance(query_list, str):
             query_list = query_list.split(",")
         self.query_list = query_list
+        # 修改：下载关键词改为从 list.txt 读取，用于下载阶段过滤
+        self.download_keywords = self.load_download_keywords()
         if not isinstance(user_id_list, list):
             if not os.path.isabs(user_id_list):
                 user_id_list = (
@@ -216,30 +218,215 @@ class Weibo(object):
         self.weibo_id_list = []  # 存储爬取到的所有微博id
         self.long_sleep_count_before_each_user = 0 #每个用户前的长时间sleep避免被ban
         self.store_binary_in_sqlite = config.get("store_binary_in_sqlite", 0)
-        self.keyword_filters = self.load_keyword_filters()
 
-    def load_keyword_filters(self):
-        """从 list.txt 读取用于下载过滤的关键词列表"""
-        keyword_file = Path(__file__).parent / "list.txt"
-        if not keyword_file.exists():
-            logger.warning("未找到关键词文件 %s，跳过下载过滤", keyword_file)
-            return []
+        # 防封禁配置初始化
+        self.anti_ban_config = config.get("anti_ban_config", {})
+        self.anti_ban_enabled = self.anti_ban_config.get("enabled", False)
+
+        # 爬取状态跟踪
+        self.crawl_stats = {
+            "weibo_count": 0,      # 已爬取微博数
+            "request_count": 0,    # 已发送请求数
+            "api_errors": 0,       # API错误数
+            "start_time": None,    # 开始时间
+            "batch_count": 0,      # 当前批次计数
+            "last_batch_time": None # 上次批次时间
+        }
+    def calculate_dynamic_delay(self):
+        """计算动态延迟时间"""
+        if not self.anti_ban_enabled:
+            return 0
+
+        config = self.anti_ban_config
+        base_delay = config.get("request_delay_min", 8)
+
+        # 根据请求次数增加延迟
+        request_count = self.crawl_stats["request_count"]
+        if request_count > 100:
+            base_delay += 5
+        if request_count > 300:
+            base_delay += 10
+
+        # 根据爬取时间增加延迟
+        if self.crawl_stats["start_time"]:
+            time_elapsed = time.time() - self.crawl_stats["start_time"]
+            if time_elapsed > 300:  # 5分钟
+                base_delay += 5
+
+        # 随机波动
+        max_delay = config.get("request_delay_max", 15)
+        return random.uniform(base_delay, max_delay)
+
+    def should_pause_session(self):
+        """检查是否应该暂停当前会话"""
+        if not self.anti_ban_enabled:
+            return False, ""
+
+        config = self.anti_ban_config
+        current_time = time.time()
+
+        # 条件1：达到数量阈值
+        max_weibo = config.get("max_weibo_per_session", 500)
+        if self.crawl_stats["weibo_count"] >= max_weibo:
+            return True, f"达到单次运行最大微博数({max_weibo})"
+
+        # 条件2：运行时间过长
+        if self.crawl_stats["start_time"]:
+            session_time = current_time - self.crawl_stats["start_time"]
+            max_time = config.get("max_session_time", 600)
+            if session_time > max_time:
+                return True, f"单次运行时间过长({int(session_time)}秒)"
+
+        # 条件3：API错误率过高
+        max_errors = config.get("max_api_errors", 5)
+        if self.crawl_stats["api_errors"] >= max_errors:
+            return True, f"API错误过多({self.crawl_stats['api_errors']}次)"
+
+        # 条件4：随机概率（模拟用户休息）
+        random_prob = config.get("random_rest_probability", 0.01)
+        if random.random() < random_prob:
+            return True, "随机休息"
+
+        return False, ""
+
+    def check_batch_delay(self):
+        """检查是否需要批次延迟"""
+        if not self.anti_ban_enabled:
+            return
+
+        config = self.anti_ban_config
+        batch_size = config.get("batch_size", 50)
+        batch_delay = config.get("batch_delay", 30)
+
+        # 检查是否达到批次大小
+        if self.crawl_stats["batch_count"] >= batch_size:
+            current_time = time.time()
+
+            # 检查距离上次批次的时间
+            if self.crawl_stats["last_batch_time"]:
+                time_since_last_batch = current_time - self.crawl_stats["last_batch_time"]
+                if time_since_last_batch < batch_delay:
+                    # 如果距离上次批次时间太短，等待补足
+                    wait_time = batch_delay - time_since_last_batch
+                    logger.info(f"批次延迟: 等待 {wait_time:.1f} 秒")
+                    sleep(wait_time)
+
+            logger.info(f"批次延迟: 等待 {batch_delay} 秒")
+            sleep(batch_delay)
+
+            # 重置批次计数
+            self.crawl_stats["batch_count"] = 0
+            self.crawl_stats["last_batch_time"] = time.time()
+
+    def get_random_headers(self):
+        """获取随机请求头"""
+        if not self.anti_ban_enabled:
+            return self.headers
+
+        config = self.anti_ban_config
+
+        # 随机选择User-Agent
+        user_agents = config.get("user_agents", [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"
+        ])
+        user_agent = random.choice(user_agents)
+
+        # 随机选择Accept-Language
+        accept_languages = config.get("accept_languages", [
+            "zh-CN,zh;q=0.9,en;q=0.8"
+        ])
+        accept_language = random.choice(accept_languages)
+
+        # 随机选择Referer
+        referers = config.get("referer_list", [
+            "https://m.weibo.cn/",
+            "https://weibo.com/"
+        ])
+        referer = random.choice(referers)
+
+        # 返回随机化的请求头
+        return {
+            'Referer': referer,
+            'accept': 'application/json, text/plain, */*',
+            'accept-language': accept_language,
+            'cache-control': 'max-age=0',
+            'priority': 'u=0, i',
+            'sec-ch-ua': '"Chromium";v="136", "Microsoft Edge";v="136", "Not.A/Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'same-origin',
+            'upgrade-insecure-requests': '1',
+            'user-agent': user_agent,
+        }
+
+    def update_crawl_stats(self, weibo_count=0, request_count=0, api_error=False):
+        """更新爬取统计"""
+        if not self.anti_ban_enabled:
+            return
+
+        if weibo_count > 0:
+            self.crawl_stats["weibo_count"] += weibo_count
+            self.crawl_stats["batch_count"] += weibo_count
+
+        if request_count > 0:
+            self.crawl_stats["request_count"] += request_count
+
+        if api_error:
+            self.crawl_stats["api_errors"] += 1
+
+    def reset_crawl_stats(self):
+        """重置爬取统计（休息后调用）"""
+        self.crawl_stats = {
+            "weibo_count": 0,
+            "request_count": 0,
+            "api_errors": 0,
+            "start_time": time.time(),
+            "batch_count": 0,
+            "last_batch_time": None
+        }
+        logger.info("爬取统计已重置，继续爬取")
+
+    def load_download_keywords(self):
+        """从 list.txt 加载下载筛选关键词"""
         try:
-            raw_content = keyword_file.read_text(encoding="utf-8")
-        except Exception as exc:
-            logger.warning("读取关键词文件 %s 失败，将跳过下载过滤 (%s)", keyword_file, exc)
+            list_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "list.txt")
+            if not os.path.isfile(list_path):
+                return []
+            with open(list_path, "r", encoding="utf-8") as f:
+                raw_keywords = f.read()
+            keywords = [kw.strip() for kw in raw_keywords.split(",") if kw.strip()]
+            if keywords:
+                logger.info("已加载下载关键词 %d 个", len(keywords))
+            return keywords
+        except Exception as e:
+            logger.warning("加载下载关键词失败，将回退为全部下载: %s", e)
             return []
-        keywords = [item.strip() for item in raw_content.split(",") if item.strip()]
-        if not keywords:
-            logger.info("关键词文件为空，跳过下载过滤")
-        return keywords
 
-    def _text_matches_keyword(self, text):
-        """检查微博正文是否包含任意关键词"""
-        if not self.keyword_filters:
-            return False
-        return any(keyword in text for keyword in self.keyword_filters)
-    
+    def perform_anti_ban_rest(self):
+        """执行防封禁休息"""
+        if not self.anti_ban_enabled:
+            return
+
+        config = self.anti_ban_config
+        rest_time_min = config.get("rest_time_min", 600)
+        
+        # 添加随机波动（±10%）
+        rest_time = int(rest_time_min * random.uniform(0.9, 1.1))
+        
+        logger.info("┌────────────────────────────────────┐")
+        logger.info("│ 🛡️ 防封禁休息中...                 │")
+        logger.info("│ 休息时间: %-4d 秒                  │", rest_time)
+        logger.info("│ 预计恢复: %s       │", 
+                   (datetime.now() + timedelta(seconds=rest_time)).strftime("%H:%M:%S"))
+        logger.info("└────────────────────────────────────┘")
+        
+        # 执行休息
+        sleep(rest_time)
+        
+        logger.info("休息结束，继续爬取微博")
+
     def validate_config(self, config):
         """验证配置是否正确"""
 
@@ -562,6 +749,14 @@ class Weibo(object):
         if "sqlite" in self.write_mode:
             self.user_to_sqlite()
 
+    def sleep_with_progress(self, seconds, desc):
+        """进度条倒计时休眠"""
+        if seconds <= 0:
+            return
+        bar_format = "等待:{total}秒 剩余{remaining} {percentage:3.0f}%|{bar}"
+        for _ in tqdm(range(seconds), desc=desc, ascii=False, bar_format=bar_format, leave=False):
+            sleep(1)
+
     def get_user_info(self):
         """获取用户信息"""
         params = {"containerid": "100505" + str(self.user_config["user_id"])}
@@ -571,16 +766,9 @@ class Weibo(object):
         # 加一个count，不需要一上来啥都没干就sleep
         if self.long_sleep_count_before_each_user > 0:
             sleep_time = random.randint(30, 60)
-            # 添加log，否则一般用户不知道以为程序卡了
+            # 修改：等待时使用进度条倒计时展示
             logger.info(f"""短暂sleep {sleep_time}秒，避免被ban""")
-            for _ in tqdm(
-                range(sleep_time),
-                desc="倒计时",
-                unit="s",
-                ncols=80,
-                ascii=True,
-            ):
-                sleep(1)
+            self.sleep_with_progress(sleep_time, "用户间等待(秒)")
             logger.info("sleep结束")  
         self.long_sleep_count_before_each_user = self.long_sleep_count_before_each_user + 1      
 
@@ -590,9 +778,23 @@ class Weibo(object):
         
         while retries < max_retries:
             try:
-                response = self.session.get(url, params=params, headers=self.headers, timeout=10)
+                logger.info(f"准备获取ID：{self.user_config['user_id']}的用户信息第{retries+1}次。")
+
+                # 防封禁：使用随机请求头
+                current_headers = self.get_random_headers()
+
+                # 防封禁：动态延迟
+                delay = self.calculate_dynamic_delay()
+                if delay > 0:
+                    logger.debug(f"动态延迟: {delay:.1f} 秒")
+                    sleep(delay)
+
+                response = self.session.get(url, params=params, headers=current_headers, timeout=10)
                 response.raise_for_status()
                 js = response.json()
+
+                # 更新统计：成功请求
+                self.update_crawl_stats(request_count=1)
                 if 'data' in js and 'userInfo' in js['data']:
                     info = js["data"]["userInfo"]
                     user_info = OrderedDict()
@@ -647,7 +849,7 @@ class Weibo(object):
                     self.user_to_database()
                     logger.info(f"成功获取到用户 {self.user_config['user_id']} 的信息。")
                     return 0
-                else:
+                elif isinstance(js.get("url"), str) and js.get("url").strip():
                     logger.warning("未能获取到用户信息，可能需要验证码验证。")
                     if self.handle_captcha(js):
                         logger.info("用户已完成验证码验证，继续请求用户信息。")
@@ -915,6 +1117,17 @@ class Weibo(object):
         self.sqlite_insert(con, file_data, "bins")
         con.close()
 
+    def should_download_by_keywords(self, weibo_entry):
+        """依据 list.txt 关键词判断是否需要下载"""
+        if not self.download_keywords:
+            return True
+        texts = []
+        texts.append(weibo_entry.get("text", ""))
+        if weibo_entry.get("retweet"):
+            texts.append(weibo_entry["retweet"].get("text", ""))
+        content = " ".join(texts)
+        return any(keyword in content for keyword in self.download_keywords)
+
     def handle_download(self, file_type, file_dir, urls, w):
         """处理下载相关操作"""
         file_prefix = w["created_at"][:11].replace("-", "") + "_" + str(w["id"])
@@ -979,22 +1192,16 @@ class Weibo(object):
             logger.info("即将进行%s下载", describe)
             file_dir = self.get_filepath(file_type)
             file_dir = file_dir + os.sep + describe
-
-            if not self.keyword_filters:
-                logger.info("关键词列表为空，跳过%s下载", describe)
-                return
             
             # 检查是否有文件需要下载
             has_files = False
             for w in self.weibo[wrote_count:]:
-                if weibo_type == "retweet":
-                    if w.get("retweet"):
-                        w = w["retweet"]
-                    else:
-                        continue
-                if not self._text_matches_keyword(w.get("text", "")):
+                if not self.should_download_by_keywords(w):  # 修改：按关键词过滤下载对象
                     continue
-                if w.get(key):
+                target_weibo = w["retweet"] if (weibo_type == "retweet" and w.get("retweet")) else w
+                if weibo_type == "retweet" and not w.get("retweet"):
+                    continue
+                if target_weibo.get(key):
                     has_files = True
                     break
             
@@ -1003,13 +1210,13 @@ class Weibo(object):
                     os.makedirs(file_dir)
                 
                 for w in tqdm(self.weibo[wrote_count:], desc="Download progress"):
+                    if not self.should_download_by_keywords(w):  # 修改：按关键词过滤下载对象
+                        continue
                     if weibo_type == "retweet":
                         if w.get("retweet"):
                             w = w["retweet"]
                         else:
                             continue
-                    if not self._text_matches_keyword(w.get("text", "")):
-                        continue
                     if w.get(key):
                         self.handle_download(file_type, file_dir, w.get(key), w)
                 
@@ -1470,6 +1677,7 @@ class Weibo(object):
         if page > req_page:
             return
         self._get_weibo_reposts_cookie(weibo, cur_count, max_count, page, on_downloaded)
+
 
 
     def get_one_page(self, page):
@@ -2857,14 +3065,10 @@ class Weibo(object):
         """运行爬虫"""
         try:
             for user_config in self.user_config_list:
-                if len(user_config["query_list"]):
-                    for query in user_config["query_list"]:
-                        self.query = query
-                        self.initialize_info(user_config)
-                        self.get_pages()
-                else:
-                    self.initialize_info(user_config)
-                    self.get_pages()
+                # 修改：一次抓取微博，下载阶段再用 list.txt 关键词过滤
+                self.query = ""
+                self.initialize_info(user_config)
+                self.get_pages()
 
                 # 当前用户所有微博和评论抓取完毕后，再导出该用户的评论 CSV
                 self.export_comments_to_csv_for_current_user()
