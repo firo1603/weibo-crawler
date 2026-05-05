@@ -2357,6 +2357,52 @@ class Weibo(object):
         connection = pymysql.connect(**mysql_config)
         self.mysql_create(connection, sql)
 
+    def mysql_ensure_column(self, mysql_config, table, column, column_definition):
+        """确保MySQL表存在指定字段"""
+        import pymysql
+
+        if self.mysql_config:
+            mysql_config = self.mysql_config
+        mysql_config["db"] = "weibo"
+        connection = pymysql.connect(**mysql_config)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = %s
+                    AND TABLE_NAME = %s
+                    AND COLUMN_NAME = %s
+                    """,
+                    (mysql_config["db"], table, column),
+                )
+                column_exists = cursor.fetchone()[0] > 0
+                if not column_exists:
+                    cursor.execute(
+                        "ALTER TABLE `{table}` ADD COLUMN {column_definition}".format(
+                            table=table.replace("`", "``"),
+                            column_definition=column_definition,
+                        )
+                    )
+            connection.commit()
+        except Exception as e:
+            connection.rollback()
+            logger.exception(e)
+            raise
+        finally:
+            connection.close()
+
+    def mysql_escape_identifier(self, identifier):
+        """转义MySQL标识符"""
+        return "`{}`".format(str(identifier).replace("`", "``"))
+
+    def mysql_format_value(self, value):
+        """转换MySQL不支持直接写入的Python值"""
+        if isinstance(value, list):
+            return ";".join(str(item) for item in value)
+        return value
+
     def mysql_insert(self, mysql_config, table, data_list):
         """
         向MySQL表插入或更新数据
@@ -2377,8 +2423,9 @@ class Weibo(object):
         import pymysql
 
         if len(data_list) > 0:
-            keys = ", ".join(data_list[0].keys())
-            values = ", ".join(["%s"] * len(data_list[0]))
+            columns = list(data_list[0].keys())
+            keys = ", ".join(self.mysql_escape_identifier(key) for key in columns)
+            values = ", ".join(["%s"] * len(columns))
             if self.mysql_config:
                 mysql_config = self.mysql_config
             mysql_config["db"] = "weibo"
@@ -2386,20 +2433,37 @@ class Weibo(object):
             cursor = connection.cursor()
             sql = """INSERT INTO {table}({keys}) VALUES ({values}) ON
                      DUPLICATE KEY UPDATE""".format(
-                table=table, keys=keys, values=values
+                table=self.mysql_escape_identifier(table), keys=keys, values=values
             )
             update = ",".join(
-                [" {key} = values({key})".format(key=key) for key in data_list[0]]
+                [
+                    " {key} = values({key})".format(
+                        key=self.mysql_escape_identifier(key)
+                    )
+                    for key in columns
+                ]
             )
             sql += update
             try:
-                cursor.executemany(sql, [tuple(data.values()) for data in data_list])
+                cursor.executemany(
+                    sql,
+                    [
+                        tuple(
+                            self.mysql_format_value(data.get(column, ""))
+                            for column in columns
+                        )
+                        for data in data_list
+                    ],
+                )
                 connection.commit()
+                return True
             except Exception as e:
                 connection.rollback()
                 logger.exception(e)
+                return False
             finally:
                 connection.close()
+        return True
 
     def weibo_to_mysql(self, wrote_count):
         """将爬取的微博信息写入MySQL数据库"""
@@ -2424,6 +2488,7 @@ class Weibo(object):
                 pics varchar(3000),
                 video_url varchar(1000),
                 live_photo_url varchar(1000),
+                links text,
                 location varchar(100),
                 created_at DATETIME,
                 source varchar(30),
@@ -2436,6 +2501,12 @@ class Weibo(object):
                 PRIMARY KEY (id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
         self.mysql_create_table(mysql_config, create_table)
+        self.mysql_ensure_column(
+            mysql_config,
+            "weibo",
+            "links",
+            "`links` text AFTER `live_photo_url`",
+        )
 
         # 要插入的微博列表
         weibo_list = []
@@ -2461,9 +2532,12 @@ class Weibo(object):
                 w["retweet_id"] = ""
             weibo_list.append(w)
         # 在'weibo'表中插入或更新微博数据
-        self.mysql_insert(mysql_config, "weibo", retweet_list)
-        self.mysql_insert(mysql_config, "weibo", weibo_list)
-        logger.info("%d条微博写入MySQL数据库完毕", self.got_count)
+        retweet_ok = self.mysql_insert(mysql_config, "weibo", retweet_list)
+        weibo_ok = self.mysql_insert(mysql_config, "weibo", weibo_list)
+        if retweet_ok and weibo_ok:
+            logger.info("%d条微博写入MySQL数据库完毕", self.got_count)
+        else:
+            logger.error("%d条微博写入MySQL数据库失败", self.got_count)
 
     def weibo_to_sqlite(self, wrote_count):
         con = self.get_sqlite_connection()
