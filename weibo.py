@@ -1407,7 +1407,8 @@ class Weibo(object):
             if "markdown" in self.write_mode and self.markdown_split_by == "day_by_month":
                 base_dir = self.get_filepath("markdown")
                 
-                for w in tqdm(self.weibo[wrote_count:], desc="Download progress"):
+                target_weibos = [w for w in self.weibo[wrote_count:] if self.should_download_by_keywords(w)]
+                for w in tqdm(target_weibos, desc="Download progress"):
                     # 对于转发微博，使用父微博的日期确定月份文件夹
                     # 这样转发的内容会与父微博保存在同一个月份目录中
                     parent_created_at = w.get("created_at", "")
@@ -1446,9 +1447,8 @@ class Weibo(object):
                 if not os.path.isdir(file_dir):
                     os.makedirs(file_dir)
                 
-                for w in tqdm(self.weibo[wrote_count:], desc="Download progress"):
-                    if not self.should_download_by_keywords(w):  # 修改：按关键词过滤下载对象
-                        continue
+                target_weibos = [w for w in self.weibo[wrote_count:] if self.should_download_by_keywords(w)]
+                for w in tqdm(target_weibos, desc="Download progress"):
                     if weibo_type == "retweet":
                         if w.get("retweet"):
                             w = w["retweet"]
