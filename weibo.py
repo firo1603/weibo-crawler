@@ -30,6 +30,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 import const
+from cookie import normalize_cookie_string, read_cookie_file, write_cookie_file
 from util import csvutil
 from util.dateutil import convert_to_days_ago
 from util.notify import push_deer
@@ -135,12 +136,12 @@ class Weibo(object):
         self.cookie_file_path = None
         if isinstance(cookie_config, str) and cookie_config.endswith('.txt'):
             self.cookie_file_path = cookie_config
-            if os.path.isfile(self.cookie_file_path):
-                with open(self.cookie_file_path, 'r', encoding='utf-8') as f:
-                    cookie_string = f.read().strip()
-                logger.info(f"从Cookie文件 {self.cookie_file_path} 读取Cookie")
+            stored_cookies = read_cookie_file(Path(self.cookie_file_path))
+            if stored_cookies:
+                cookie_string = stored_cookies[-1]  # 使用最新一条
+                logger.info(f"从Cookie文件 {self.cookie_file_path} 读取Cookie（共{len(stored_cookies)}条，使用最新一条）")
             else:
-                logger.warning(f"Cookie文件 {self.cookie_file_path} 不存在，将使用默认空Cookie")
+                logger.warning(f"Cookie文件 {self.cookie_file_path} 不存在或为空，将使用默认空Cookie")
                 cookie_string = ""
         elif os.environ.get("WEIBO_COOKIE"):
             logger.info("使用环境变量WEIBO_COOKIE中的Cookie")
@@ -3582,21 +3583,18 @@ class Weibo(object):
         self.weibo_id_list = []
 
     def save_cookies_to_file(self):
-        """将 Session 中最新的 Cookie 写回文件"""
+        """将 Session 中最新的 Cookie 规范化后追加写回文件，保留历史记录"""
         if not self.cookie_file_path:
             return
         
         try:
-            # 将 requests.cookies.RequestsCookieJar 转换为字符串格式 "key=value; key2=value2"
-            cookie_list = []
-            for cookie in self.session.cookies:
-                cookie_list.append(f"{cookie.name}={cookie.value}")
-            
-            cookie_string = "; ".join(cookie_list)
-            
-            with open(self.cookie_file_path, 'w', encoding='utf-8') as f:
-                f.write(cookie_string)
-            
+            raw = "; ".join(f"{c.name}={c.value}" for c in self.session.cookies)
+            new_cookie = normalize_cookie_string(raw)
+            if not new_cookie:
+                return
+            existing = read_cookie_file(Path(self.cookie_file_path))
+            existing.append(new_cookie)
+            write_cookie_file(Path(self.cookie_file_path), existing)
             logger.info(f"最新的 Cookie 已写回文件: {self.cookie_file_path}")
         except Exception as e:
             logger.error(f"保存 Cookie 到文件失败: {e}")

@@ -1,4 +1,5 @@
 config.json
+cookie.txt
 list.txt
 user_id_list.txt
 download_by_keyword.py
