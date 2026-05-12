@@ -129,8 +129,20 @@ class Weibo(object):
         )  # 输出目录配置，默认为"weibo"
         
         # Cookie支持：优先使用环境变量WEIBO_COOKIE，其次使用config.json中的配置
-        cookie_string = os.environ.get("WEIBO_COOKIE") or config.get("cookie")
-        if os.environ.get("WEIBO_COOKIE"):
+        cookie_config = config.get("cookie")
+        cookie_string = os.environ.get("WEIBO_COOKIE") or cookie_config
+        
+        self.cookie_file_path = None
+        if isinstance(cookie_config, str) and cookie_config.endswith('.txt'):
+            self.cookie_file_path = cookie_config
+            if os.path.isfile(self.cookie_file_path):
+                with open(self.cookie_file_path, 'r', encoding='utf-8') as f:
+                    cookie_string = f.read().strip()
+                logger.info(f"从Cookie文件 {self.cookie_file_path} 读取Cookie")
+            else:
+                logger.warning(f"Cookie文件 {self.cookie_file_path} 不存在，将使用默认空Cookie")
+                cookie_string = ""
+        elif os.environ.get("WEIBO_COOKIE"):
             logger.info("使用环境变量WEIBO_COOKIE中的Cookie")
         
         core_cookies = {}   # 核心包
@@ -3569,6 +3581,26 @@ class Weibo(object):
         self.got_count = 0
         self.weibo_id_list = []
 
+    def save_cookies_to_file(self):
+        """将 Session 中最新的 Cookie 写回文件"""
+        if not self.cookie_file_path:
+            return
+        
+        try:
+            # 将 requests.cookies.RequestsCookieJar 转换为字符串格式 "key=value; key2=value2"
+            cookie_list = []
+            for cookie in self.session.cookies:
+                cookie_list.append(f"{cookie.name}={cookie.value}")
+            
+            cookie_string = "; ".join(cookie_list)
+            
+            with open(self.cookie_file_path, 'w', encoding='utf-8') as f:
+                f.write(cookie_string)
+            
+            logger.info(f"最新的 Cookie 已写回文件: {self.cookie_file_path}")
+        except Exception as e:
+            logger.error(f"保存 Cookie 到文件失败: {e}")
+
     def start(self):
         """运行爬虫"""
         try:
@@ -3587,6 +3619,8 @@ class Weibo(object):
                     self.update_user_config_file(self.user_config_file_path)
         except Exception as e:
             logger.exception(e)
+        finally:
+            self.save_cookies_to_file()
 
 
 def handle_config_renaming(config, oldName, newName):
